@@ -80,6 +80,107 @@ bicubic_filter(float x) {
 
 static struct filter BICUBIC = { bicubic_filter, 2.0 };
 
+/* Fast paths for common image formats - these functions are much simpler,
+   allowing the GCC tree vectorizer to work */
+void
+fast_uint8_vertical_stretch(Imaging imIn, Imaging imOut, float *k, struct filter *filterp, float filterscale,
+                            float scale, float support) {
+    float center, ww, ss, ymin, ymax;
+    int xx, yy, y;
+
+    for (yy = 0; yy < imOut->ysize; yy++) {
+        center = (yy + 0.5) * scale;
+        ww = 0.0;
+        ss = 1.0 / filterscale;
+        /* calculate filter weights */
+        ymin = floor(center - support);
+        if (ymin < 0.0)
+            ymin = 0.0;
+        ymax = ceil(center + support);
+        if (ymax > (float) imIn->ysize)
+            ymax = (float) imIn->ysize;
+        for (y = (int) ymin; y < (int) ymax; y++) {
+            float w = filterp->filter((y - center + 0.5) * ss) * ss;
+            k[y - (int) ymin] = w;
+            ww = ww + w;
+        }
+        if (ww == 0.0)
+            ww = 1.0;
+        else
+            ww = 1.0 / ww;
+
+
+        for (xx = 0; xx < imOut->xsize * 4; xx++) {
+            /* FIXME: skip over unused pixels */
+            ss = 0.0;
+            for (y = (int) ymin; y < (int) ymax; y++)
+                ss = ss + (UINT8) imIn->image[y][xx] * k[y - (int) ymin];
+            ss = ss * ww + 0.5;
+            if (ss < 0.5)
+                imOut->image[yy][xx] = (UINT8) 0;
+            else if (ss >= 255.0)
+                imOut->image[yy][xx] = (UINT8) 255;
+            else
+                imOut->image[yy][xx] = (UINT8) ss;
+        }
+    }
+}
+
+void
+fast_uint8_horizontal_stretch(Imaging imIn, Imaging imOut, float *k, struct filter *filterp,
+                              float filterscale, float scale, float support) {
+    float center, ww, ss, xmin, xmax;
+    int xx, yy, x, b;
+
+    for (xx = 0; xx < imOut->xsize; xx++) {
+        center = (xx + 0.5) * scale;
+        ww = 0.0;
+        ss = 1.0 / filterscale;
+        xmin = floor(center - support);
+        if (xmin < 0.0) {
+            xmin = 0.0;
+        }
+
+        xmax = ceil(center + support);
+        if (xmax > (float) imIn->xsize) {
+            xmax = (float) imIn->xsize;
+        }
+
+        for (x = (int) xmin; x < (int) xmax; x++) {
+            float w = filterp->filter((x - center + 0.5) * ss) * ss;
+            k[x - (int) xmin] = w;
+            ww = ww + w;
+        }
+
+        if (ww == 0.0) {
+            ww = 1.0;
+        } else {
+            ww = 1.0 / ww;
+        }
+
+        for (yy = 0; yy < imOut->ysize; yy++) {
+            for (b = 0; b < imIn->bands; b++) {
+                if (imIn->bands == 2 && b) {
+                    b = 3;      /* hack to deal with LA images */
+                }
+
+                ss = 0.0;
+                for (x = (int) xmin; x < (int) xmax; x++) {
+                    ss = ss + (UINT8) imIn->image[yy][x * 4 + b] * k[x - (int) xmin];
+                }
+
+                ss = ss * ww + 0.5;
+                if (ss < 0.5)
+                    imOut->image[yy][xx * 4 + b] = (UINT8) 0;
+                else if (ss >= 255.0)
+                    imOut->image[yy][xx * 4 + b] = (UINT8) 255;
+                else
+                    imOut->image[yy][xx * 4 + b] = (UINT8) ss;
+            }
+        }
+    }
+}
+
 Imaging
 ImagingStretch(Imaging imOut, Imaging imIn, int filter) {
     /* FIXME: this is a quick and straightforward translation from a
@@ -141,159 +242,135 @@ ImagingStretch(Imaging imOut, Imaging imIn, int filter) {
     ImagingSectionEnter(&cookie);
     if (imIn->xsize == imOut->xsize) {
         /* vertical stretch */
-        for (yy = 0; yy < imOut->ysize; yy++) {
-            center = (yy + 0.5) * scale;
-            ww = 0.0;
-            ss = 1.0 / filterscale;
-            /* calculate filter weights */
-            ymin = floor(center - support);
-            if (ymin < 0.0)
-                ymin = 0.0;
-            ymax = ceil(center + support);
-            if (ymax > (float) imIn->ysize)
-                ymax = (float) imIn->ysize;
-            for (y = (int) ymin; y < (int) ymax; y++) {
-                float w = filterp->filter((y - center + 0.5) * ss) * ss;
-                k[y - (int) ymin] = w;
-                ww = ww + w;
+        if (!imIn->image8 && imIn->type == IMAGING_TYPE_UINT8) {
+            fast_uint8_vertical_stretch(imIn, imOut, k, filterp, filterscale, scale, support);
+        } else {
+            for (yy = 0; yy < imOut->ysize; yy++) {
+                center = (yy + 0.5) * scale;
+                ww = 0.0;
+                ss = 1.0 / filterscale;
+                /* calculate filter weights */
+                ymin = floor(center - support);
+                if (ymin < 0.0)
+                    ymin = 0.0;
+                ymax = ceil(center + support);
+                if (ymax > (float) imIn->ysize)
+                    ymax = (float) imIn->ysize;
+                for (y = (int) ymin; y < (int) ymax; y++) {
+                    float w = filterp->filter((y - center + 0.5) * ss) * ss;
+                    k[y - (int) ymin] = w;
+                    ww = ww + w;
+                }
+                if (ww == 0.0)
+                    ww = 1.0;
+                else
+                    ww = 1.0 / ww;
+                if (imIn->image8) {
+                    /* 8-bit grayscale */
+                    for (xx = 0; xx < imOut->xsize; xx++) {
+                        ss = 0.0;
+                        for (y = (int) ymin; y < (int) ymax; y++)
+                            ss = ss + imIn->image8[y][xx] * k[y - (int) ymin];
+                        ss = ss * ww + 0.5;
+                        if (ss < 0.5)
+                            imOut->image8[yy][xx] = 0;
+                        else if (ss >= 255.0)
+                            imOut->image8[yy][xx] = 255;
+                        else
+                            imOut->image8[yy][xx] = (UINT8) ss;
+                    }
+                } else {
+                    switch (imIn->type) {
+                      case IMAGING_TYPE_INT32:
+                          /* 32-bit integer */
+                          for (xx = 0; xx < imOut->xsize; xx++) {
+                              ss = 0.0;
+                              for (y = (int) ymin; y < (int) ymax; y++)
+                                  ss = ss + IMAGING_PIXEL_I(imIn, xx, y) * k[y - (int) ymin];
+                              IMAGING_PIXEL_I(imOut, xx, yy) = (int) ss *ww;
+                          }
+                          break;
+                      case IMAGING_TYPE_FLOAT32:
+                          /* 32-bit float */
+                          for (xx = 0; xx < imOut->xsize; xx++) {
+                              ss = 0.0;
+                              for (y = (int) ymin; y < (int) ymax; y++)
+                                  ss = ss + IMAGING_PIXEL_F(imIn, xx, y) * k[y - (int) ymin];
+                              IMAGING_PIXEL_F(imOut, xx, yy) = ss * ww;
+                          }
+                          break;
+                      default:
+                          ImagingSectionLeave(&cookie);
+                          return (Imaging) ImagingError_ModeError();
+                    }
+                }
             }
-            if (ww == 0.0)
-                ww = 1.0;
-            else
-                ww = 1.0 / ww;
-            if (imIn->image8) {
-                /* 8-bit grayscale */
-                for (xx = 0; xx < imOut->xsize; xx++) {
-                    ss = 0.0;
-                    for (y = (int) ymin; y < (int) ymax; y++)
-                        ss = ss + imIn->image8[y][xx] * k[y - (int) ymin];
-                    ss = ss * ww + 0.5;
-                    if (ss < 0.5)
-                        imOut->image8[yy][xx] = 0;
-                    else if (ss >= 255.0)
-                        imOut->image8[yy][xx] = 255;
-                    else
-                        imOut->image8[yy][xx] = (UINT8) ss;
-                }
-            } else
-                switch (imIn->type) {
-                  case IMAGING_TYPE_UINT8:
-                      /* n-bit grayscale */
-                      for (xx = 0; xx < imOut->xsize * 4; xx++) {
-                          /* FIXME: skip over unused pixels */
-                          ss = 0.0;
-                          for (y = (int) ymin; y < (int) ymax; y++)
-                              ss = ss + (UINT8) imIn->image[y][xx] * k[y - (int) ymin];
-                          ss = ss * ww + 0.5;
-                          if (ss < 0.5)
-                              imOut->image[yy][xx] = (UINT8) 0;
-                          else if (ss >= 255.0)
-                              imOut->image[yy][xx] = (UINT8) 255;
-                          else
-                              imOut->image[yy][xx] = (UINT8) ss;
-                      }
-                      break;
-                  case IMAGING_TYPE_INT32:
-                      /* 32-bit integer */
-                      for (xx = 0; xx < imOut->xsize; xx++) {
-                          ss = 0.0;
-                          for (y = (int) ymin; y < (int) ymax; y++)
-                              ss = ss + IMAGING_PIXEL_I(imIn, xx, y) * k[y - (int) ymin];
-                          IMAGING_PIXEL_I(imOut, xx, yy) = (int) ss *ww;
-                      }
-                      break;
-                  case IMAGING_TYPE_FLOAT32:
-                      /* 32-bit float */
-                      for (xx = 0; xx < imOut->xsize; xx++) {
-                          ss = 0.0;
-                          for (y = (int) ymin; y < (int) ymax; y++)
-                              ss = ss + IMAGING_PIXEL_F(imIn, xx, y) * k[y - (int) ymin];
-                          IMAGING_PIXEL_F(imOut, xx, yy) = ss * ww;
-                      }
-                      break;
-                  default:
-                      ImagingSectionLeave(&cookie);
-                      return (Imaging) ImagingError_ModeError();
-                }
         }
     } else {
         /* horizontal stretch */
-        for (xx = 0; xx < imOut->xsize; xx++) {
-            center = (xx + 0.5) * scale;
-            ww = 0.0;
-            ss = 1.0 / filterscale;
-            xmin = floor(center - support);
-            if (xmin < 0.0)
-                xmin = 0.0;
-            xmax = ceil(center + support);
-            if (xmax > (float) imIn->xsize)
-                xmax = (float) imIn->xsize;
-            for (x = (int) xmin; x < (int) xmax; x++) {
-                float w = filterp->filter((x - center + 0.5) * ss) * ss;
-                k[x - (int) xmin] = w;
-                ww = ww + w;
-            }
-            if (ww == 0.0)
-                ww = 1.0;
-            else
-                ww = 1.0 / ww;
-            if (imIn->image8) {
-                /* 8-bit grayscale */
-                for (yy = 0; yy < imOut->ysize; yy++) {
-                    ss = 0.0;
-                    for (x = (int) xmin; x < (int) xmax; x++)
-                        ss = ss + imIn->image8[yy][x] * k[x - (int) xmin];
-                    ss = ss * ww + 0.5;
-                    if (ss < 0.5)
-                        imOut->image8[yy][xx] = (UINT8) 0;
-                    else if (ss >= 255.0)
-                        imOut->image8[yy][xx] = (UINT8) 255;
-                    else
-                        imOut->image8[yy][xx] = (UINT8) ss;
+        if (0 && !imIn->image8 && imIn->type == IMAGING_TYPE_UINT8) {
+            /* n-bit grayscale */
+            fast_uint8_horizontal_stretch(imIn, imOut, k, filterp, filterscale, scale, support);
+        } else {
+            for (xx = 0; xx < imOut->xsize; xx++) {
+                center = (xx + 0.5) * scale;
+                ww = 0.0;
+                ss = 1.0 / filterscale;
+                xmin = floor(center - support);
+                if (xmin < 0.0)
+                    xmin = 0.0;
+                xmax = ceil(center + support);
+                if (xmax > (float) imIn->xsize)
+                    xmax = (float) imIn->xsize;
+                for (x = (int) xmin; x < (int) xmax; x++) {
+                    float w = filterp->filter((x - center + 0.5) * ss) * ss;
+                    k[x - (int) xmin] = w;
+                    ww = ww + w;
                 }
-            } else
-                switch (imIn->type) {
-                  case IMAGING_TYPE_UINT8:
-                      /* n-bit grayscale */
-                      for (yy = 0; yy < imOut->ysize; yy++) {
-                          for (b = 0; b < imIn->bands; b++) {
-                              if (imIn->bands == 2 && b)
-                                  b = 3;        /* hack to deal with LA images */
+                if (ww == 0.0)
+                    ww = 1.0;
+                else
+                    ww = 1.0 / ww;
+                if (imIn->image8) {
+                    /* 8-bit grayscale */
+                    for (yy = 0; yy < imOut->ysize; yy++) {
+                        ss = 0.0;
+                        for (x = (int) xmin; x < (int) xmax; x++)
+                            ss = ss + imIn->image8[yy][x] * k[x - (int) xmin];
+                        ss = ss * ww + 0.5;
+                        if (ss < 0.5)
+                            imOut->image8[yy][xx] = (UINT8) 0;
+                        else if (ss >= 255.0)
+                            imOut->image8[yy][xx] = (UINT8) 255;
+                        else
+                            imOut->image8[yy][xx] = (UINT8) ss;
+                    }
+                } else {
+                    switch (imIn->type) {
+                      case IMAGING_TYPE_INT32:
+                          /* 32-bit integer */
+                          for (yy = 0; yy < imOut->ysize; yy++) {
                               ss = 0.0;
                               for (x = (int) xmin; x < (int) xmax; x++)
-                                  ss = ss + (UINT8) imIn->image[yy][x * 4 + b] * k[x - (int) xmin];
-                              ss = ss * ww + 0.5;
-                              if (ss < 0.5)
-                                  imOut->image[yy][xx * 4 + b] = (UINT8) 0;
-                              else if (ss >= 255.0)
-                                  imOut->image[yy][xx * 4 + b] = (UINT8) 255;
-                              else
-                                  imOut->image[yy][xx * 4 + b] = (UINT8) ss;
+                                  ss = ss + IMAGING_PIXEL_I(imIn, x, yy) * k[x - (int) xmin];
+                              IMAGING_PIXEL_I(imOut, xx, yy) = (int) ss *ww;
                           }
-                      }
-                      break;
-                  case IMAGING_TYPE_INT32:
-                      /* 32-bit integer */
-                      for (yy = 0; yy < imOut->ysize; yy++) {
-                          ss = 0.0;
-                          for (x = (int) xmin; x < (int) xmax; x++)
-                              ss = ss + IMAGING_PIXEL_I(imIn, x, yy) * k[x - (int) xmin];
-                          IMAGING_PIXEL_I(imOut, xx, yy) = (int) ss *ww;
-                      }
-                      break;
-                  case IMAGING_TYPE_FLOAT32:
-                      /* 32-bit float */
-                      for (yy = 0; yy < imOut->ysize; yy++) {
-                          ss = 0.0;
-                          for (x = (int) xmin; x < (int) xmax; x++)
-                              ss = ss + IMAGING_PIXEL_F(imIn, x, yy) * k[x - (int) xmin];
-                          IMAGING_PIXEL_F(imOut, xx, yy) = ss * ww;
-                      }
-                      break;
-                  default:
-                      ImagingSectionLeave(&cookie);
-                      return (Imaging) ImagingError_ModeError();
+                          break;
+                      case IMAGING_TYPE_FLOAT32:
+                          /* 32-bit float */
+                          for (yy = 0; yy < imOut->ysize; yy++) {
+                              ss = 0.0;
+                              for (x = (int) xmin; x < (int) xmax; x++)
+                                  ss = ss + IMAGING_PIXEL_F(imIn, x, yy) * k[x - (int) xmin];
+                              IMAGING_PIXEL_F(imOut, xx, yy) = ss * ww;
+                          }
+                          break;
+                      default:
+                          ImagingSectionLeave(&cookie);
+                          return (Imaging) ImagingError_ModeError();
+                    }
                 }
+            }
         }
     }
     ImagingSectionLeave(&cookie);
